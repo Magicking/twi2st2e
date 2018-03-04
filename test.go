@@ -60,7 +60,8 @@ func run() (err error) {
 	}()
 
 	// Instantiate the WebSocket transport.
-	t, err := websocket.NewTransport(url)
+	urls := []string{url}
+	t, err := websocket.NewTransport(urls)
 	if err != nil {
 		return err
 	}
