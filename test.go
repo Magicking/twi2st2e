@@ -1,54 +1,144 @@
 package main
 
 import (
+	// Stdlib
+	"flag"
 	"fmt"
-	"go-steem/rpc"
-	"time"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+
+	// RPC
+	"github.com/go-steem/rpc"
+	"github.com/go-steem/rpc/encoding/wif"
+	"github.com/go-steem/rpc/transactions"
+	"github.com/go-steem/rpc/transports/websocket"
+	"github.com/go-steem/rpc/types"
+
+	// Vendor
+	"github.com/pkg/errors"
+	"golang.org/x/crypto/ssh/terminal"
 )
 
 func main() {
-	// Instantiate the WebSocket transport.
-	t, _ := websocket.NewTransport("ws://localhost:8090")
-
-	// Use the transport to create an RPC client.
-	client, _ := rpc.NewClient(t)
-	defer client.Close()
-
-	// Call "get_config".
-	config, _ := client.Database.GetConfig()
-
-	// Start processing blocks.
-	lastBlock := 1800000
-	for {
-		// Call "get_dynamic_global_properties".
-		props, _ := client.Database.GetDynamicGlobalProperties()
-
-		for props.LastIrreversibleBlockNum-lastBlock > 0 {
-			// Call "get_block".
-			block, _ := client.Database.GetBlock(lastBlock)
-
-			// Process the transactions.
-			for _, tx := range block.Transactions {
-				for _, op := range tx.Operations {
-					switch body := op.Data().(type) {
-					// Comment operation.
-					case *types.CommentOperation:
-						content, _ := client.Database.GetContent(body.Author, body.Permlink)
-						fmt.Printf("COMMENT @%v %v\n", content.Author, content.URL)
-
-					// Vote operation.
-					case *types.VoteOperation:
-						fmt.Printf("VOTE @%v @%v/%v\n", body.Voter, body.Author, body.Permlink)
-
-						// You can add more cases, it depends on what
-						// operations you actually need to process.
-					}
-				}
-			}
-
-			lastBlock++
-		}
-
-		time.Sleep(time.Duration(config.SteemitBlockInterval) * time.Second)
+	if err := run(); err != nil {
+		log.Fatalln("Error:", err)
 	}
+}
+
+func run() (err error) {
+	// Process flags.
+	flagAddress := flag.String("rpc_endpoint", "ws://localhost:8090", "steemd RPC endpoint address")
+	flag.Parse()
+
+	url := *flagAddress
+
+	// Process args.
+	args := flag.Args()
+	if len(args) != 3 {
+		return errors.New("3 arguments required")
+	}
+	author, permlink, voter := args[0], args[1], args[2]
+
+	// Prompt for WIF.
+	wifKey, err := promptWIF(voter)
+	if err != nil {
+		return err
+	}
+
+	// Start catching signals.
+	var interrupted bool
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// Drop the error in case it is a request being interrupted.
+	defer func() {
+		if err == websocket.ErrClosing && interrupted {
+			err = nil
+		}
+	}()
+
+	// Instantiate the WebSocket transport.
+	t, err := websocket.NewTransport(url)
+	if err != nil {
+		return err
+	}
+
+	// Use the transport to get an RPC client.
+	client, err := rpc.NewClient(t)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if !interrupted {
+			client.Close()
+		}
+	}()
+
+	// Start processing signals.
+	go func() {
+		<-signalCh
+		fmt.Println()
+		log.Println("Signal received, exiting...")
+		signal.Stop(signalCh)
+		interrupted = true
+		client.Close()
+	}()
+
+	// Get the props to get the head block number and ID
+	// so that we can use that for the transaction.
+	props, err := client.Database.GetDynamicGlobalProperties()
+	if err != nil {
+		return err
+	}
+
+	// Prepare the transaction.
+	refBlockPrefix, err := transactions.RefBlockPrefix(props.HeadBlockID)
+	if err != nil {
+		return err
+	}
+
+	tx := transactions.NewSignedTransaction(&types.Transaction{
+		RefBlockNum:    transactions.RefBlockNum(props.HeadBlockNumber),
+		RefBlockPrefix: refBlockPrefix,
+	})
+
+	tx.PushOperation(&types.VoteOperation{
+		Voter:    voter,
+		Author:   author,
+		Permlink: permlink,
+		Weight:   10000,
+	})
+
+	// Sign.
+	privKey, err := wif.Decode(wifKey)
+	if err != nil {
+		return err
+	}
+	privKeys := [][]byte{privKey}
+
+	if err := tx.Sign(privKeys, transactions.SteemChain); err != nil {
+		return err
+	}
+
+	// Broadcast.
+	resp, err := client.NetworkBroadcast.BroadcastTransactionSynchronous(tx.Transaction)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%+v\n", *resp)
+
+	// Success!
+	return nil
+}
+
+func promptWIF(accountName string) (string, error) {
+	fmt.Printf("Please insert WIF for account @%v: ", accountName)
+	passwd, err := terminal.ReadPassword(syscall.Stdin)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to read WIF from the terminal")
+	}
+	fmt.Println()
+	return string(passwd), nil
 }
